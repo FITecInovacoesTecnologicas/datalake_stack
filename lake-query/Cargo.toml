@@ -1,0 +1,30 @@
+[package]
+name = "lake-query"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Arrow Flight SQL endpoint over DataFusion with the Iceberg REST catalog registered"
+publish = false
+
+[[bin]]
+name = "lake-query"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+# Versions aligned with iceberg-rust 0.10.x (arrow/parquet 58, datafusion 53, tonic 0.14).
+arrow-flight = { version = "58", features = ["flight-sql-experimental"] }
+datafusion = { version = "53.1", default-features = false, features = ["parquet", "sql"] }
+futures = "0.3"
+iceberg = "0.10"
+iceberg-catalog-rest = "0.10"
+iceberg-datafusion = "0.10"
+prost = "0.14"
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tonic = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[profile.release]
+codegen-units = 16
+lto = "thin"
