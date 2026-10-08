@@ -1,0 +1,116 @@
+# Taskfile - sobe, valida e derruba a pilha rust-datalake (https://taskfile.dev, Task >= 3.30).
+# Equivale ao Makefile, alvo por alvo. Segredos ficam no arquivo .env; o Task nunca os le.
+#
+#   task                         # lista as tarefas
+#   task up-query                # core + lake-query
+#   task logs SERVICE=lake-worker
+#   ENV_FILE=outro.env task up   # outro arquivo de ambiente (ou: task up ENV_FILE=outro.env)
+version: '3'
+
+vars:
+  COMPOSE: '{{.COMPOSE | default "docker compose"}}'
+  ENV_FILE: '{{.ENV_FILE | default ".env"}}'
+  WORKERS: '{{.WORKERS | default "3"}}'
+  DB: '{{.DB | default "jobs"}}'
+  DC: '{{.COMPOSE}} --env-file {{.ENV_FILE}}'
+
+tasks:
+  default:
+    desc: Lista as tarefas disponiveis
+    silent: true
+    cmds:
+      - '{{.TASK_EXE}} --list'
+
+  env:
+    desc: Gera o .env a partir de env.example com segredos aleatorios (nao sobrescreve)
+    silent: true
+    cmds:
+      - bash scripts/gen-env.sh "{{.ENV_FILE}}"
+
+  check:
+    desc: Renderiza o compose offline e imprime o fact sheet (sem subir nada)
+    cmds:
+      - bash scripts/check-compose.sh --out -
+
+  build:
+    desc: Constroi as imagens (jobs-db, lake-worker, lake-query)
+    preconditions:
+      - &need-env-file
+        sh: test -f "{{.ENV_FILE}}"
+        msg: "falta {{.ENV_FILE}}: rode 'task env' primeiro"
+    cmds:
+      - '{{.DC}} --profile query build'
+
+  up:
+    desc: Sobe o core (rustfs, postgres, lakekeeper, lake-worker)
+    preconditions: [*need-env-file]
+    cmds:
+      - '{{.DC}} up -d --build'
+
+  up-query:
+    desc: Sobe o core + lake-query (Flight SQL em 127.0.0.1:50051)
+    preconditions: [*need-env-file]
+    cmds:
+      - '{{.DC}} --profile query up -d --build'
+
+  ps:
+    desc: Estado dos servicos
+    preconditions: [*need-env-file]
+    cmds:
+      - '{{.DC}} --profile query --profile ops ps -a'
+
+  logs:
+    desc: Segue os logs (SERVICE=lake-worker para filtrar)
+    preconditions: [*need-env-file]
+    cmds:
+      - '{{.DC}} --profile query logs -f {{.SERVICE}}'
+
+  scale:
+    desc: Escala o worker (WORKERS=3)
+    preconditions: [*need-env-file]
+    cmds:
+      - '{{.DC}} up -d --no-build --scale lake-worker={{.WORKERS}} lake-worker'
+
+  psql:
+    desc: Abre psql no Postgres (DB=jobs|catalog)
+    interactive: true
+    preconditions: [*need-env-file]
+    cmds:
+      - '{{.DC}} exec postgres sh -c ''psql -U "$POSTGRES_USER" -d {{.DB}}'''
+
+  backup:
+    desc: pg_dump de catalog e jobs + copia do bucket do lake em ./backups
+    preconditions: [*need-env-file]
+    cmds:
+      # Em sequencia, para que catalogo e dados correspondam ao mesmo momento.
+      - '{{.DC}} --profile ops run --rm pg-backup'
+      - '{{.DC}} --profile ops run --rm lake-backup'
+
+  smoke:
+    desc: Sobe a pilha em projeto isolado, valida tudo e derruba
+    cmds:
+      - bash scripts/smoke.sh
+
+  test:
+    desc: Self-test do checker e contrato dos documentos da avaliacao (se docs/assessment existir)
+    cmds:
+      - bash tests/check-assessment-test.sh
+      - cmd: |
+          if [ -d docs/assessment ]; then python3 scripts/check-assessment.py all docs/assessment
+          else echo "docs/assessment ausente: contrato dos documentos nao verificado"; fi
+        silent: true
+
+  down:
+    desc: Para os servicos, mantendo os volumes
+    preconditions: [*need-env-file]
+    cmds:
+      - '{{.DC}} --profile query --profile ops down'
+
+  down-volumes:
+    desc: Para e APAGA volumes (dados e catalogo); exige CONFIRM=yes
+    preconditions:
+      - *need-env-file
+      - sh: test "{{.CONFIRM}}" = "yes"
+        msg: "recusado: apaga rustfs-data e pg-data. Rode 'task down-volumes CONFIRM=yes' se for isso mesmo."
+    cmds:
+      - '{{.DC}} --profile query --profile ops down -v --remove-orphans'

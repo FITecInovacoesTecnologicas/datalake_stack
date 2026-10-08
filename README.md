@@ -22,7 +22,7 @@ E indicado para quem precisa experimentar pipelines raw -> clean -> curated sobr
 - **lake-worker:** consome a fila com `FOR UPDATE SKIP LOCKED` e escala horizontalmente (`--scale lake-worker=N`). A entrega e *at-least-once*: o worker envia heartbeat, um reaper recupera jobs de workers mortos, ha retry com backoff exponencial e o worker reconecta ao Postgres sozinho. Executa SQL sobre o catalogo Iceberg (`lake`), usa memory pool e spill do DataFusion e faz shutdown gracioso em SIGTERM (grace period de 2 min).
 - **lake-query (perfil `query`):** endpoint Arrow Flight SQL **somente leitura** sobre DataFusion, com o catalogo Iceberg registrado como `lake` e atualizado a cada `LAKE_METADATA_CACHE_TTL_SECS`. Exige token (`LAKE_QUERY_TOKEN`) e responde aos metadados que ferramentas JDBC/ADBC consultam.
 - **pg-backup e lake-backup (perfil `ops`):** `pg_dump` dos dois bancos e copia do bucket do lake em `./backups`, sob demanda.
-- **Operacao por Makefile:** gera segredos, sobe, escala, faz backup, roda o smoke test e derruba a pilha.
+- **Operacao por Makefile ou Taskfile:** gera segredos, sobe, escala, faz backup, roda o smoke test e derruba a pilha.
 - **Smoke test isolado:** sobe a pilha inteira em um projeto Compose separado, com portas e segredos proprios, e valida cada componente.
 
 ## Arquitetura
@@ -73,7 +73,7 @@ Ordem de inicializacao: `rustfs` -> `storage-init` | `postgres` -> `lakekeeper-m
 ### Pre-requisitos
 
 - Docker Engine 24+ com Compose v2 e BuildKit habilitado.
-- `openssl`, `curl` e `bash` no host. `make` e opcional, mas recomendado.
+- `openssl`, `curl` e `bash` no host. `make` ou [Task](https://taskfile.dev) sao opcionais, mas recomendados.
 - Nao e preciso toolchain Rust: `lake-worker` e `lake-query` compilam dentro do `docker build`.
 
 ### Subir a pilha
@@ -149,6 +149,23 @@ Rode `make help` para listar todos os alvos.
 | `make down-volumes CONFIRM=yes` | Para os servicos e **apaga** `rustfs-data` e `pg-data` |
 
 Para usar outro arquivo de ambiente, rode `ENV_FILE=outro.env make up`.
+
+### Comandos do Taskfile
+
+O [Taskfile.yml](Taskfile.yml) tem as mesmas tarefas do Makefile, com os mesmos nomes e variaveis. Use o que preferir: os dois chamam os mesmos comandos do Docker Compose e o mesmo script de geracao do `.env`.
+
+```bash
+task                              # lista as tarefas (o mesmo que task --list)
+task env                          # gera .env
+task up-query                     # core + lake-query
+task logs SERVICE=lake-worker     # variaveis vao depois do nome da tarefa
+task scale WORKERS=3
+task psql DB=catalog
+task down-volumes CONFIRM=yes     # recusa sem CONFIRM=yes
+ENV_FILE=outro.env task up        # ou: task up ENV_FILE=outro.env
+```
+
+Requer Task 3.30 ou mais recente. Para ver o comando que uma tarefa executaria sem roda-lo, use `task --dry <tarefa>`.
 
 ### Sem Makefile
 
@@ -228,6 +245,7 @@ O pool de memoria do DataFusion deve ficar abaixo do limite do container. O exce
 docker-compose.yml       pilha completa (perfis: query, ops)
 env.example              variaveis obrigatorias e pins de versao
 Makefile                 atalhos de operacao (make help)
+Taskfile.yml             as mesmas tarefas para o Task (task --list)
 Cargo.toml / Cargo.lock  workspace Rust (lake-worker + lake-query) e lock unico
 Dockerfile               build das imagens Rust (targets lake-worker e lake-query)
 jobs-db/                 imagem Postgres 16 + pg_cron
@@ -237,6 +255,7 @@ lake-worker/             worker Rust (DataFusion 53, iceberg-rust 0.10, tokio-po
 lake-query/              endpoint Flight SQL (arrow-flight 58, DataFusion 53, tonic 0.14)
 scripts/
   smoke.sh               smoke test ponta a ponta em projeto isolado
+  gen-env.sh             gera o .env com segredos aleatorios (make env / task env)
   check-compose.sh       fact sheet JSON do compose, sem subir nada
   check-assessment.py    valida o contrato dos documentos de avaliacao
 tests/
@@ -263,7 +282,7 @@ docker compose up -d --build lake-worker
 
 As imagens Rust saem de um unico [Dockerfile](Dockerfile) na raiz, que compila o workspace Cargo inteiro numa so execucao do cargo. As dependencias (DataFusion, Arrow, iceberg-rust) sao compiladas uma vez para os dois binarios, e o `target/` fica num cache do BuildKit, entao rebuilds incrementais sao rapidos. Por isso o build de `lake-worker` tambem compila `lake-query`, e vice-versa.
 
-O LTO fica desligado por padrao para encurtar o build. Para uma imagem de producao, rode `RUST_RELEASE_LTO=thin make build` ou defina a variavel no `.env`.
+O LTO fica desligado por padrao para encurtar o build. Para uma imagem de producao, rode `RUST_RELEASE_LTO=thin make build` (ou `task build`) ou defina a variavel no `.env`.
 
 ### Testes
 
@@ -299,7 +318,7 @@ Ao final, derruba a pilha com os volumes e imprime `SMOKE=OK`. Use `KEEP=1` para
 ## Contribuindo
 
 1. Crie uma branch a partir de `main` e vincule o trabalho ao item correspondente no Jira.
-2. Rode `make check` e `make smoke` antes de abrir o PR.
+2. Rode `make check` e `make smoke` (ou `task check` e `task smoke`) antes de abrir o PR.
 3. Mantenha versoes de imagem fixadas em `env.example` e portas expostas apenas em `127.0.0.1`.
 4. Nunca faca commit de `.env`, dumps em `backups/` ou qualquer segredo.
 5. Todo merge exige revisao de par, inclusive para codigo gerado com apoio de IA.

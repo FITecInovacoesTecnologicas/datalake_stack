@@ -18,21 +18,7 @@ help: ## Lista os alvos disponiveis
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
 
 env: ## Gera $(ENV_FILE) a partir de env.example com segredos aleatorios (nao sobrescreve)
-	@if [ -e "$(ENV_FILE)" ]; then echo "$(ENV_FILE) ja existe; nada a fazer"; exit 0; fi; \
-	umask 077; \
-	while IFS= read -r line; do \
-	  if [[ "$$line" =~ ^([A-Z0-9_]+)=$$ ]]; then \
-	    k="$${BASH_REMATCH[1]}"; \
-	    case "$$k" in \
-	      LAKE_S3_ACCESS_KEY) v=$$(openssl rand -hex 10) ;; \
-	      LAKE_S3_SECRET_KEY) v=$$(openssl rand -hex 20) ;; \
-	      *) v=$$(openssl rand -hex 24) ;; \
-	    esac; \
-	    printf '%s=%s\n' "$$k" "$$v"; \
-	  else printf '%s\n' "$$line"; fi; \
-	done < env.example > "$(ENV_FILE)"; \
-	chmod 600 "$(ENV_FILE)"; \
-	echo "escrito $(ENV_FILE) (0600). Guarde LAKEKEEPER_ENCRYPTION_KEY fora do host: sem ela o catalogo nao e restauravel."
+	@bash scripts/gen-env.sh "$(ENV_FILE)"
 
 $(ENV_FILE):
 	@echo "falta $(ENV_FILE): rode 'make env' primeiro"; exit 1
