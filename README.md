@@ -12,16 +12,16 @@ O objetivo e ter um ambiente de desenvolvimento / prova de conceito pequeno, rap
 
 E indicado para quem precisa experimentar pipelines raw -> clean -> curated sobre Iceberg, ou validar uma arquitetura lakehouse antes de escolher infraestrutura definitiva.
 
-> **Estado:** `lake-worker` e `lake-query` sao *scaffolds*. Eles compilam, sobem e cumprem o contrato operacional, mas a logica de transformacao ainda nao existe. Veja [Limitacoes conhecidas](#limitacoes-conhecidas).
+> **Estado:** o `lake-worker` executa jobs `sql` (DDL e append sobre Iceberg), mas ainda nao tem jobs de negocio. O `lake-query` atende consultas so de leitura. Veja [Limitacoes conhecidas](#limitacoes-conhecidas) e o passo a passo em [docs/funcionamento.md](docs/funcionamento.md).
 
 ## Funcionalidades
 
 - **Object storage S3 (RustFS):** bucket `lake` com chave de servico restrita ao bucket. A chave root so e usada pelo job `storage-init`.
 - **Catalogo Iceberg REST (Lakekeeper):** bootstrap e warehouse criados automaticamente e de forma idempotente, com metadados no Postgres e credenciais cifradas por `LAKEKEEPER_ENCRYPTION_KEY`.
 - **Postgres 16 + pg_cron:** uma instancia com dois bancos isolados por role, `catalog` (Lakekeeper) e `jobs` (fila `jobs.job_queue` + agendamento).
-- **lake-worker:** consome a fila com `FOR UPDATE SKIP LOCKED` e escala horizontalmente (`--scale lake-worker=N`). Usa memory pool e spill do DataFusion e faz shutdown gracioso em SIGTERM (grace period de 2 min).
-- **lake-query (perfil `query`):** endpoint Arrow Flight SQL sobre DataFusion, com o catalogo Iceberg registrado como `lake`.
-- **pg-backup (perfil `ops`):** `pg_dump` sob demanda dos dois bancos em `./backups`.
+- **lake-worker:** consome a fila com `FOR UPDATE SKIP LOCKED` e escala horizontalmente (`--scale lake-worker=N`). A entrega e *at-least-once*: o worker envia heartbeat, um reaper recupera jobs de workers mortos, ha retry com backoff exponencial e o worker reconecta ao Postgres sozinho. Executa SQL sobre o catalogo Iceberg (`lake`), usa memory pool e spill do DataFusion e faz shutdown gracioso em SIGTERM (grace period de 2 min).
+- **lake-query (perfil `query`):** endpoint Arrow Flight SQL **somente leitura** sobre DataFusion, com o catalogo Iceberg registrado como `lake` e atualizado a cada `LAKE_METADATA_CACHE_TTL_SECS`. Exige token (`LAKE_QUERY_TOKEN`) e responde aos metadados que ferramentas JDBC/ADBC consultam.
+- **pg-backup e lake-backup (perfil `ops`):** `pg_dump` dos dois bancos e copia do bucket do lake em `./backups`, sob demanda.
 - **Operacao por Makefile:** gera segredos, sobe, escala, faz backup, roda o smoke test e derruba a pilha.
 - **Smoke test isolado:** sobe a pilha inteira em um projeto Compose separado, com portas e segredos proprios, e valida cada componente.
 
@@ -66,6 +66,7 @@ Ordem de inicializacao: `rustfs` -> `storage-init` | `postgres` -> `lakekeeper-m
 | `lake-worker` | build `./lake-worker` | core | - |
 | `lake-query` | build `./lake-query` | `query` | 50051 (Flight SQL) |
 | `pg-backup` | `rust-datalake/postgres:local` | `ops` (sob demanda) | - |
+| `lake-backup` | `rustfs/rc:${RC_VERSION}` | `ops` (sob demanda) | - |
 
 ## Quick start
 
@@ -94,16 +95,36 @@ make psql       # psql no banco jobs (DB=catalog para o catalogo)
 ```
 
 ```sql
-insert into jobs.job_queue (kind, payload) values ('refresh-curated', '{"table": "sales"}');
+-- job sql: uma instrucao ou uma lista, executadas em ordem sobre o catalogo `lake`
+insert into jobs.job_queue (kind, payload) values ('sql', '{"sql": [
+  "CREATE SCHEMA IF NOT EXISTS lake.raw",
+  "CREATE TABLE IF NOT EXISTS lake.raw.vendas (id BIGINT, produto VARCHAR, valor DOUBLE)",
+  "INSERT INTO lake.raw.vendas VALUES (1, ''cafe'', 12.5)"
+]}');
 
 -- agendar com pg_cron (UTC):
 select cron.schedule('nightly', '0 3 * * *',
-  $$insert into jobs.job_queue(kind) values ('refresh-curated')$$);
+  $$insert into jobs.job_queue(kind, payload) values ('sql', '{"sql": "INSERT INTO lake.curated.t SELECT ..."}')$$);
 
-select id, kind, status, attempts, last_error from jobs.job_queue order by id desc limit 10;
+select id, kind, status, attempts, max_attempts, last_error from jobs.job_queue order by id desc limit 10;
 ```
 
 O worker verifica a fila a cada `POLL_INTERVAL_SECS` (5 s), marca o job como `running` e, ao terminar, como `done` ou `failed` (com `last_error`).
+
+Kinds disponiveis:
+
+| `kind` | O que faz |
+|---|---|
+| `sql` | Executa `payload.sql` (string ou lista) no DataFusion. `CREATE SCHEMA lake.x` cria um namespace Iceberg; `CREATE TABLE` e `INSERT INTO` (append) gravam no lake. |
+| `noop`, `smoke` | Nao faz nada; serve para testes. |
+| qualquer outro | Falha na hora, sem retry (`unknown job kind`). |
+
+Como a fila se comporta em falhas:
+
+- **Erro no job:** o job volta para `queued` com `available_at = now() + JOB_RETRY_BACKOFF_SECS * 2^(tentativa-1)` (no maximo 1 h), ate `max_attempts` (padrao 3; pode ser definido por job no `insert`). Erros de payload e `kind` desconhecido nao sao repetidos.
+- **Worker morto (OOM, kill -9):** o job em `running` para de receber heartbeat. Depois de `JOB_LEASE_SECS` (60 s), qualquer replica o devolve para `queued`.
+- **Postgres reiniciado:** o worker reconecta na proxima consulta a fila.
+- Como um job pode rodar mais de uma vez, ele precisa ser seguro para repetir (`IF NOT EXISTS`, cargas idempotentes).
 
 ## Uso
 
@@ -122,7 +143,7 @@ Rode `make help` para listar todos os alvos.
 | `make logs SERVICE=lake-worker` | Segue os logs (sem `SERVICE`, de todos) |
 | `make scale WORKERS=3` | Escala o `lake-worker` |
 | `make psql DB=jobs` | Abre `psql` (`DB=jobs` ou `DB=catalog`) |
-| `make backup` | Faz `pg_dump -Fc` de `catalog` e `jobs` em `./backups` |
+| `make backup` | Faz `pg_dump -Fc` de `catalog` e `jobs` e copia o bucket do lake para `./backups` |
 | `make smoke` | Smoke test em projeto isolado (veja [Testes](#testes)) |
 | `make down` | Para os servicos e mantem os volumes |
 | `make down-volumes CONFIRM=yes` | Para os servicos e **apaga** `rustfs-data` e `pg-data` |
@@ -142,6 +163,7 @@ docker compose up -d --build                  # core
 docker compose --profile query up -d --build  # + lake-query
 docker compose up -d --scale lake-worker=3    # mais workers
 docker compose --profile ops run --rm pg-backup
+docker compose --profile ops run --rm lake-backup
 ```
 
 ### Endpoints locais
@@ -152,7 +174,7 @@ docker compose --profile ops run --rm pg-backup
 | Console RustFS | `http://127.0.0.1:9001` |
 | Lakekeeper REST + UI | `http://127.0.0.1:8181` (catalogo em `/catalog`, gestao em `/management/v1`) |
 | Postgres | `127.0.0.1:5433` (bancos `jobs` e `catalog`) |
-| Flight SQL | `grpc://127.0.0.1:50051` (perfil `query`) |
+| Flight SQL | `grpc://127.0.0.1:50051` (perfil `query`; header `authorization: Bearer $LAKE_QUERY_TOKEN`, ou usuario qualquer com senha = token) |
 
 ## Configuracao
 
@@ -181,6 +203,9 @@ Todas as variaveis ficam em `.env`, gerado a partir de [env.example](env.example
 | `PG_ADMIN_USER` / `PG_ADMIN_PASSWORD` | Superusuario do Postgres | `lake_admin` / segredo |
 | `CATALOG_DB_PASSWORD` | Senha da role `lakekeeper` (banco `catalog`) | segredo |
 | `JOBS_WORKER_PASSWORD` | Senha da role `lake_worker` (banco `jobs`). Use hex: ela entra em uma URL | segredo |
+| `LAKE_QUERY_TOKEN` | Token exigido em toda chamada Flight SQL ao `lake-query` | segredo |
+| `JOB_LEASE_SECS` | Tempo sem heartbeat ate um job `running` voltar para a fila | `60` |
+| `JOB_RETRY_BACKOFF_SECS` | Atraso base do retry (dobra a cada tentativa, maximo 1 h) | `30` |
 
 ### Limites de recursos (opcionais)
 
@@ -218,7 +243,15 @@ tests/
 
 ### Implementar transformacoes
 
-A logica de negocio do worker fica no hook `run_job` em [lake-worker/src/main.rs](lake-worker/src/main.rs). Ele recebe o `SessionContext` do DataFusion (com o catalogo Iceberg), o `kind` e o `payload` do job. Um retorno `Ok(())` marca o job como `done` e um `Err` o marca como `failed`.
+A logica de negocio do worker fica no hook `run_job` em [lake-worker/src/main.rs](lake-worker/src/main.rs), com um ramo do `match` por `kind`. O hook recebe o `SessionContext` do DataFusion (com o catalogo Iceberg registrado como `lake`) e o job (`kind`, `payload`, tentativa).
+
+- Um retorno `Ok(())` marca o job como `done`.
+- Um `Err` agenda um retry ou, esgotadas as tentativas, marca o job como `failed`.
+- Um erro `permanent(...)` falha o job na hora.
+
+Antes de executar SQL, chame `lake.refresh()` para enxergar tabelas criadas por outros jobs.
+
+Para casos simples, um job `sql` ja resolve sem codigo novo.
 
 Depois de alterar o codigo, recompile so o servico:
 
@@ -246,16 +279,18 @@ O smoke test sobe a pilha inteira no projeto `rust-datalake-smoke`, com portas 1
 
 Ao final, derruba a pilha com os volumes e imprime `SMOKE=OK`. Use `KEEP=1` para manter a pilha no ar e `SMOKE_TIMEOUT_SECS` para ajustar a espera (default `600`).
 
-> `make test` depende de `docs/assessment/`, que nao esta neste repositorio. Alem disso, hoje `tests/check-assessment-test.sh` falha com `cp: cannot copy a directory ... into itself`.
+> `make test` roda o self-test do `check-assessment.py`. O contrato de `docs/assessment/` so e verificado se o diretorio existir; ele nao faz parte deste repositorio.
 
 ## Limitacoes conhecidas
 
-- **Scaffolds:** hoje `run_job` executa apenas `SELECT 1`, e o Flight SQL responde somente a statements simples. Os demais metodos retornam `unimplemented`.
-- **Sem `Cargo.lock` commitado:** gere o arquivo dentro do container e faca commit, para ter builds reproduziveis.
+- **Sem jobs de negocio:** o worker so conhece `sql` e `noop`. Transformacoes que nao cabem em SQL precisam de um novo `kind` em `run_job`.
+- **Flight SQL parcial:** prepared statements, chaves primarias e estrangeiras e tipos XDBC respondem `unimplemented`. O endpoint e somente leitura e usa um token compartilhado, sem usuarios nem TLS.
+- **Tabelas de metadados Iceberg:** `SELECT * FROM lake.ns."t$snapshots"` funciona, mas escolher colunas ou agregar gera erro interno (bug do `iceberg-datafusion` 0.10.1, que ignora a projecao).
+- **Atualizar dependencias Rust:** os `Cargo.lock` estao commitados e o build usa `--locked`. Para atualizar, rode `cargo update` dentro de um container `rust:1.99-bookworm` e faca commit do lock.
 - **Escrita Iceberg limitada:** iceberg-rust 0.10 faz append / `INSERT INTO`. Overwrite, delete e compaction precisam de outra estrategia.
 - **Manutencao de tabelas:** expiracao de snapshots, limpeza de arquivos orfaos e compaction nao estao cobertas.
 - **Lakekeeper sem autenticacao:** so e aceitavel enquanto a porta 8181 estiver em localhost. Antes de expor a porta, configure `LAKEKEEPER__OPENID_PROVIDER_URI` / `LAKEKEEPER__OPENID_AUDIENCE` e faca um novo bootstrap.
-- **Backups parciais:** `pg-backup` cobre apenas os bancos. O volume `rustfs-data` ainda nao tem rotina de backup.
+- **Backup sem agendamento:** `make backup` copia bancos e bucket, mas nao ha rotina periodica nem copia para fora do host. Rode `pg-backup` e `lake-backup` em sequencia (o alvo do Makefile ja faz isso) para que catalogo e dados correspondam ao mesmo momento.
 
 ## Contribuindo
 

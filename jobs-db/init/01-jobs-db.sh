@@ -14,7 +14,8 @@ CREATE ROLE lake_worker LOGIN PASSWORD :'worker_pw';
 
 CREATE SCHEMA jobs AUTHORIZATION lake_worker;
 
--- Minimal queue the worker polls with FOR UPDATE SKIP LOCKED. Semantics live in the worker.
+-- Queue the worker polls with FOR UPDATE SKIP LOCKED. Semantics live in the worker, which
+-- also adds max_attempts/heartbeat_at/claimed_by to volumes created before they existed.
 CREATE TABLE jobs.job_queue (
     id           bigserial PRIMARY KEY,
     kind         text        NOT NULL,
@@ -22,8 +23,11 @@ CREATE TABLE jobs.job_queue (
     status       text        NOT NULL DEFAULT 'queued'
                  CHECK (status IN ('queued', 'running', 'done', 'failed')),
     attempts     integer     NOT NULL DEFAULT 0,
+    max_attempts integer     NOT NULL DEFAULT 3,
     available_at timestamptz NOT NULL DEFAULT now(),
     claimed_at   timestamptz,
+    claimed_by   text,
+    heartbeat_at timestamptz,
     finished_at  timestamptz,
     last_error   text
 );

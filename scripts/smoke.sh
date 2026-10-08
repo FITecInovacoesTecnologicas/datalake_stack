@@ -123,7 +123,9 @@ wait_for "lake-worker running" "$TIMEOUT" running lake-worker
 wait_for "lake-worker polling" 90 bash -c "docker compose -p '$PROJECT' --env-file '$ENV_FILE' -f docker-compose.yml -f '$OVERRIDE' --profile query logs lake-worker 2>/dev/null | grep -qi 'polling jobs.job_queue'"
 compose exec -T postgres psql -U "$PG_ADMIN_USER" -d jobs -tAc "insert into jobs.job_queue(kind, payload) values ('smoke', '{\"from\":\"smoke.sh\"}') returning id" >/dev/null || fail "could not enqueue a job"
 wait_for "smoke job done" 60 bash -c "docker compose -p '$PROJECT' --env-file '$ENV_FILE' -f docker-compose.yml -f '$OVERRIDE' --profile query exec -T postgres psql -U '$PG_ADMIN_USER' -d jobs -tAc \"select count(*) from jobs.job_queue where kind='smoke' and status='done'\" | grep -qx 1"
-echo "smoke: lake-worker polled the queue and completed a job"
+compose exec -T postgres psql -U "$PG_ADMIN_USER" -d jobs -tAc "insert into jobs.job_queue(kind) values ('smoke-unknown-kind')" >/dev/null || fail "could not enqueue a job"
+wait_for "unknown kind failed without retry" 60 bash -c "docker compose -p '$PROJECT' --env-file '$ENV_FILE' -f docker-compose.yml -f '$OVERRIDE' --profile query exec -T postgres psql -U '$PG_ADMIN_USER' -d jobs -tAc \"select count(*) from jobs.job_queue where kind='smoke-unknown-kind' and status='failed' and attempts=1\" | grep -qx 1"
+echo "smoke: lake-worker polled the queue, completed a job and failed an unknown kind"
 
 step="query"
 wait_for "lake-query running" "$TIMEOUT" running lake-query

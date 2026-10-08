@@ -8,7 +8,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 CHECK="python3 scripts/check-assessment.py"
 mkdir -p tests/.tmp
 SCRATCH="$(mktemp -d tests/.tmp/XXXXXX)"
-trap 'rm -rf "$SCRATCH"; rmdir tests/.tmp 2>/dev/null || true' EXIT
+MUTATED="$(mktemp -d tests/.tmp/XXXXXX)"
+trap 'rm -rf "$SCRATCH" "$MUTATED"; rmdir tests/.tmp 2>/dev/null || true' EXIT
 mkdir -p "$SCRATCH/evidence"
 
 cat > "$SCRATCH/evidence/compose-facts.json" <<'JSON'
@@ -171,7 +172,8 @@ expect_pass summary $CHECK summary "$S/README.md" --review "$S/01-compose-review
 expect_pass all     $CHECK all "$S"
 
 # Mutations: each copies the fixture, breaks one rule, expects rejection.
-M="$SCRATCH/mut"; rm -rf "$M"; cp -R "$S" "$M"
+# The copy lives outside $S: copying a directory into itself fails.
+M="$MUTATED"; cp -R "$S/." "$M"
 grep -v 'Premissa: rapida' "$S/01-compose-review.md" > "$M/01-compose-review.md"
 expect_fail "review: missing premise" $CHECK review "$M/01-compose-review.md" --facts "$S/evidence/compose-facts.json"
 

@@ -1,13 +1,16 @@
 # syntax=docker/dockerfile:1.7
-# lake-query: multi-stage build with cargo cache mounts (see lake-worker/Dockerfile).
+# lake-query: multi-stage build with a dependency layer and a target cache (see lake-worker/Dockerfile).
 FROM rust:1.99-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
+# Dependencies are downloaded into this layer, so they are fetched again only when
+# Cargo.lock changes. (A registry cache mount shared by the parallel worker and query
+# builds failed with "File exists" when both unpacked the same new crate.)
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo fetch --locked
 COPY src ./src
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
-    cargo build --release && cp target/release/lake-query /lake-query
+# Each service keeps its own target cache, so the two builds never wait on each other.
+RUN --mount=type=cache,id=lake-query-target,target=/app/target \
+    cargo build --release --locked --offline && cp target/release/lake-query /lake-query
 
 FROM debian:bookworm-slim
 RUN set -eux; \

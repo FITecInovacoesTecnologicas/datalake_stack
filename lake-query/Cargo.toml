@@ -14,11 +14,14 @@ path = "src/main.rs"
 anyhow = "1.0"
 # Versions aligned with iceberg-rust 0.10.x (arrow/parquet 58, datafusion 53, tonic 0.14).
 arrow-flight = { version = "58", features = ["flight-sql-experimental"] }
+base64 = "0.22"
 datafusion = { version = "53.1", default-features = false, features = ["parquet", "sql"] }
 futures = "0.3"
 iceberg = "0.10"
 iceberg-catalog-rest = "0.10"
 iceberg-datafusion = "0.10"
+# Since 0.10 the S3 FileIO lives here; the REST catalog needs it to read/write table files.
+iceberg-storage-opendal = { version = "0.10", default-features = false, features = ["opendal-s3"] }
 prost = "0.14"
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tonic = "0.14"

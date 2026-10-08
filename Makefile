@@ -61,15 +61,17 @@ scale: $(ENV_FILE) ## Escala o worker (WORKERS=3)
 psql: $(ENV_FILE) ## Abre psql no Postgres (DB=jobs|catalog)
 	$(DC) exec postgres sh -c 'psql -U "$$POSTGRES_USER" -d $(DB)'
 
-backup: $(ENV_FILE) ## pg_dump de catalog e jobs em ./backups
+backup: $(ENV_FILE) ## pg_dump de catalog e jobs + copia do bucket do lake em ./backups
 	$(DC) --profile ops run --rm pg-backup
+	$(DC) --profile ops run --rm lake-backup
 
 smoke: ## Sobe a pilha em projeto isolado, valida tudo e derruba
 	bash scripts/smoke.sh
 
-test: ## Self-test do checker e contrato dos documentos da avaliacao
+test: ## Self-test do checker e contrato dos documentos da avaliacao (se docs/assessment existir)
 	bash tests/check-assessment-test.sh
-	python3 scripts/check-assessment.py all docs/assessment
+	@if [ -d docs/assessment ]; then python3 scripts/check-assessment.py all docs/assessment; \
+	else echo "docs/assessment ausente: contrato dos documentos nao verificado"; fi
 
 down: $(ENV_FILE) ## Para os servicos, mantendo os volumes
 	$(DC) --profile query --profile ops down
