@@ -1,0 +1,12 @@
+# Cargo workspace: lake-worker and lake-query share one Cargo.lock and one target dir,
+# so DataFusion, Arrow and iceberg-rust are compiled once for both binaries.
+[workspace]
+members = ["lake-worker", "lake-query"]
+resolver = "2"
+
+# Profiles live here: Cargo ignores [profile] sections in member manifests.
+# The Docker build turns LTO off by default (build arg CARGO_PROFILE_RELEASE_LTO,
+# set from RUST_RELEASE_LTO in .env); a production build sets it back to "thin".
+[profile.release]
+codegen-units = 16
+lto = "thin"

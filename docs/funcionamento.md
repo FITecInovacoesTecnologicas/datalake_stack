@@ -101,26 +101,30 @@ Tres imagens sao construidas localmente:
 | Imagem | Origem | O que faz o build | Tamanho final |
 |---|---|---|---|
 | `rust-datalake/postgres:local` | [jobs-db/Dockerfile](../jobs-db/Dockerfile) | `postgres:16.15-bookworm` + `apt install postgresql-16-cron` | 445 MB |
-| `rust-datalake/lake-worker:local` | [lake-worker/Dockerfile](../lake-worker/Dockerfile) | `cargo build --release` em `rust:1.99-bookworm`; copia so o binario para `debian:bookworm-slim` | 240 MB |
-| `rust-datalake/lake-query:local` | [lake-query/Dockerfile](../lake-query/Dockerfile) | Idem, com `arrow-flight` + `iceberg-datafusion` | 258 MB |
+| `rust-datalake/lake-worker:local` | [Dockerfile](../Dockerfile), target `lake-worker` | `cargo build --release --workspace` em `rust:1.99-bookworm`; copia so o binario para `debian:bookworm-slim` | 266 MB |
+| `rust-datalake/lake-query:local` | [Dockerfile](../Dockerfile), target `lake-query` | Mesmo estagio `builder`; copia o binario `lake-query` | 267 MB |
 
 As imagens Rust usam **build multi-stage**:
 
 - **Estagio `builder`:**
-  1. copia `Cargo.toml` e `Cargo.lock` e roda `cargo fetch --locked` com um `main.rs` provisorio. As dependencias ficam nessa camada da imagem, que so e refeita quando o `Cargo.lock` muda;
-  2. copia `src/` e compila com `cargo build --release --locked --offline`. O diretorio `target/` fica num cache do BuildKit proprio de cada servico (`id=lake-worker-target` / `id=lake-query-target`), entao so o primeiro build e lento e os dois builds rodam em paralelo sem se bloquear.
+  1. copia o `Cargo.toml` e o `Cargo.lock` do workspace e os `Cargo.toml` dos dois crates, e roda `cargo fetch --locked` com `main.rs` provisorios. As dependencias ficam nessa camada da imagem, que so e refeita quando o `Cargo.lock` muda;
+  2. copia os `src/` dos dois crates e compila o workspace inteiro com `cargo build --release --locked --offline --workspace`. As dependencias comuns (DataFusion, Arrow, iceberg-rust) sao compiladas uma unica vez. O diretorio `target/` fica num cache do BuildKit (`id=rust-datalake-target`), entao so o primeiro build e lento;
+  3. o LTO fica desligado por padrao (build arg `CARGO_PROFILE_RELEASE_LTO=false`, vindo de `RUST_RELEASE_LTO` no `.env`). Use `thin` para uma imagem de producao.
+- **Um estagio para os dois servicos:** o compose escolhe a imagem final com `build.target`. Os dois targets usam o mesmo estagio `builder`, e o BuildKit o executa uma vez so. O contexto de build e a raiz do repositorio, e o [.dockerignore](../.dockerignore) envia apenas os manifests e os `src/`, nunca o `.env` nem `backups/`.
 - **Estagio final:** Debian slim com `ca-certificates`, um usuario sem privilegios (`lake`, uid 10001) e o diretorio `/spill`. O toolchain Rust nao vai para a imagem final.
 
-Tempos da primeira compilacao nesta maquina (12 CPUs):
+Tempos da primeira compilacao nesta maquina (12 CPUs), com cache vazio:
 
-- `lake-worker`: **7m47s**
-- `lake-query`: **14m05s** (mais dependencias: Flight, tonic, `iceberg-datafusion`)
+| Montagem do build | `lake-worker` + `lake-query` |
+|---|---|
+| Dois crates separados, LTO `thin` (ate 2026-10-07) | perto de 15 min (worker 7m47s e query 14m05s, em paralelo) |
+| Workspace unico, LTO desligado (2026-10-08) | **6m54s** no total, dos quais 6m27s de `cargo build` |
 
-Os dois builds rodam em paralelo, entao o tempo total ficou perto de 15 minutos. Rebuilds incrementais, como `docker compose up -d --build lake-worker` depois de editar o `main.rs`, recompilam so o crate alterado.
+Rebuilds incrementais, como `docker compose up -d --build lake-worker` depois de editar o `main.rs`, recompilam so o crate alterado.
 
-Os `Cargo.lock` estao versionados e o build usa `--locked`, entao builds em datas diferentes geram os mesmos binarios. Para atualizar dependencias, rode `cargo update` dentro de um container `rust:1.99-bookworm` e faca commit do lock.
+O `Cargo.lock` do workspace, na raiz, esta versionado e o build usa `--locked`, entao builds em datas diferentes geram os mesmos binarios. Para atualizar dependencias, rode `cargo update` dentro de um container `rust:1.99-bookworm` e faca commit do lock.
 
-> Historico: na primeira versao, os dois builds compartilhavam o cache do registry do cargo. Quando surgiu um crate novo, os dois tentaram desempacota-lo ao mesmo tempo e um falhou com `File exists`. A camada de dependencias por servico eliminou a disputa.
+> Historico: na primeira versao, os dois builds compartilhavam o cache do registry do cargo. Quando surgiu um crate novo, os dois tentaram desempacota-lo ao mesmo tempo e um falhou com `File exists`. A camada de dependencias por servico eliminou a disputa. Hoje ha um unico estagio `builder` para o workspace, entao nao existem dois builds concorrentes.
 
 ---
 

@@ -63,8 +63,8 @@ Ordem de inicializacao: `rustfs` -> `storage-init` | `postgres` -> `lakekeeper-m
 | `lakekeeper-migrate` | `quay.io/lakekeeper/catalog:${LAKEKEEPER_VERSION}` | core (one-shot) | - |
 | `lakekeeper` | `quay.io/lakekeeper/catalog:${LAKEKEEPER_VERSION}` | core | 8181 (REST + UI) |
 | `lakekeeper-init` | `curlimages/curl:${CURL_VERSION}` | core (one-shot) | - |
-| `lake-worker` | build `./lake-worker` | core | - |
-| `lake-query` | build `./lake-query` | `query` | 50051 (Flight SQL) |
+| `lake-worker` | build `./Dockerfile`, target `lake-worker` | core | - |
+| `lake-query` | build `./Dockerfile`, target `lake-query` | `query` | 50051 (Flight SQL) |
 | `pg-backup` | `rust-datalake/postgres:local` | `ops` (sob demanda) | - |
 | `lake-backup` | `rustfs/rc:${RC_VERSION}` | `ops` (sob demanda) | - |
 
@@ -228,6 +228,8 @@ O pool de memoria do DataFusion deve ficar abaixo do limite do container. O exce
 docker-compose.yml       pilha completa (perfis: query, ops)
 env.example              variaveis obrigatorias e pins de versao
 Makefile                 atalhos de operacao (make help)
+Cargo.toml / Cargo.lock  workspace Rust (lake-worker + lake-query) e lock unico
+Dockerfile               build das imagens Rust (targets lake-worker e lake-query)
 jobs-db/                 imagem Postgres 16 + pg_cron
   init/00-catalog-db.sh  cria banco/role catalog e extensoes do Lakekeeper
   init/01-jobs-db.sh     cria pg_cron, role lake_worker e jobs.job_queue
@@ -259,7 +261,9 @@ Depois de alterar o codigo, recompile so o servico:
 docker compose up -d --build lake-worker
 ```
 
-As imagens Rust usam build multi-stage com cache do cargo (BuildKit), entao rebuilds incrementais sao rapidos.
+As imagens Rust saem de um unico [Dockerfile](Dockerfile) na raiz, que compila o workspace Cargo inteiro numa so execucao do cargo. As dependencias (DataFusion, Arrow, iceberg-rust) sao compiladas uma vez para os dois binarios, e o `target/` fica num cache do BuildKit, entao rebuilds incrementais sao rapidos. Por isso o build de `lake-worker` tambem compila `lake-query`, e vice-versa.
+
+O LTO fica desligado por padrao para encurtar o build. Para uma imagem de producao, rode `RUST_RELEASE_LTO=thin make build` ou defina a variavel no `.env`.
 
 ### Testes
 
@@ -286,7 +290,7 @@ Ao final, derruba a pilha com os volumes e imprime `SMOKE=OK`. Use `KEEP=1` para
 - **Sem jobs de negocio:** o worker so conhece `sql` e `noop`. Transformacoes que nao cabem em SQL precisam de um novo `kind` em `run_job`.
 - **Flight SQL parcial:** prepared statements, chaves primarias e estrangeiras e tipos XDBC respondem `unimplemented`. O endpoint e somente leitura e usa um token compartilhado, sem usuarios nem TLS.
 - **Tabelas de metadados Iceberg:** `SELECT * FROM lake.ns."t$snapshots"` funciona, mas escolher colunas ou agregar gera erro interno (bug do `iceberg-datafusion` 0.10.1, que ignora a projecao).
-- **Atualizar dependencias Rust:** os `Cargo.lock` estao commitados e o build usa `--locked`. Para atualizar, rode `cargo update` dentro de um container `rust:1.99-bookworm` e faca commit do lock.
+- **Atualizar dependencias Rust:** o `Cargo.lock` do workspace, na raiz, esta commitado e o build usa `--locked`. Para atualizar, rode `cargo update` dentro de um container `rust:1.99-bookworm` e faca commit do lock.
 - **Escrita Iceberg limitada:** iceberg-rust 0.10 faz append / `INSERT INTO`. Overwrite, delete e compaction precisam de outra estrategia.
 - **Manutencao de tabelas:** expiracao de snapshots, limpeza de arquivos orfaos e compaction nao estao cobertas.
 - **Lakekeeper sem autenticacao:** so e aceitavel enquanto a porta 8181 estiver em localhost. Antes de expor a porta, configure `LAKEKEEPER__OPENID_PROVIDER_URI` / `LAKEKEEPER__OPENID_AUDIENCE` e faca um novo bootstrap.

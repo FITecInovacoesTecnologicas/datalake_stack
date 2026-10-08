@@ -44,6 +44,15 @@ x-lake-client-env: &lake-client-env
   LAKE_ACCESS_DELEGATION: client-managed
   RUST_LOG: info
 
+# Build of the Rust services: one Dockerfile at the repo root (Cargo workspace), one
+# target per service. Both targets share the builder stage, so the dependencies are
+# compiled once. RUST_RELEASE_LTO=thin turns link-time optimization back on.
+x-rust-build: &rust-build
+  context: .
+  dockerfile: Dockerfile
+  args:
+    CARGO_PROFILE_RELEASE_LTO: ${RUST_RELEASE_LTO:-false}
+
 services:
   rustfs:
     image: rustfs/rustfs:${RUSTFS_VERSION:?pin RUSTFS_VERSION in .env (>= 1.0.0, never latest)}
@@ -265,7 +274,9 @@ services:
 
   # Rust worker: claims queued jobs and runs transformations.
   lake-worker:
-    build: ./lake-worker
+    build:
+      <<: *rust-build
+      target: lake-worker
     image: rust-datalake/lake-worker:local
     restart: unless-stopped
     init: true                # forwards SIGTERM to the worker so the grace period is real
@@ -297,7 +308,9 @@ services:
   # Not started by default. Every call needs LAKE_QUERY_TOKEN (Bearer, or Basic password).
   lake-query:
     profiles: ["query"]
-    build: ./lake-query
+    build:
+      <<: *rust-build
+      target: lake-query
     image: rust-datalake/lake-query:local
     restart: unless-stopped
     init: true

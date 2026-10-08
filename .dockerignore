@@ -1,0 +1,9 @@
+# The build context is the repo root (Cargo workspace). Send only what the Rust build
+# needs: never .env, backups/, .git or a local target/.
+*
+!Cargo.toml
+!Cargo.lock
+!lake-worker/Cargo.toml
+!lake-worker/src/**
+!lake-query/Cargo.toml
+!lake-query/src/**
