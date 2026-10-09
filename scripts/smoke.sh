@@ -2,6 +2,8 @@
 # smoke.sh — bring the whole stack up from a clean checkout and prove every component answers.
 #
 # Usage: bash scripts/smoke.sh            (SMOKE_TIMEOUT_SECS=600 by default; KEEP=1 leaves the stack up)
+#        SMOKE_INGEST_HTTP=1 bash scripts/smoke.sh   also runs the ingest_http job against the public
+#                                                    BCB API (needs internet access) and a clean job
 #
 # - Runs under its own compose project (rust-datalake-smoke) with its own host ports, so a real
 #   deployment on this host is never touched.
@@ -126,6 +128,44 @@ wait_for "smoke job done" 60 bash -c "docker compose -p '$PROJECT' --env-file '$
 compose exec -T postgres psql -U "$PG_ADMIN_USER" -d jobs -tAc "insert into jobs.job_queue(kind) values ('smoke-unknown-kind')" >/dev/null || fail "could not enqueue a job"
 wait_for "unknown kind failed without retry" 60 bash -c "docker compose -p '$PROJECT' --env-file '$ENV_FILE' -f docker-compose.yml -f '$OVERRIDE' --profile query exec -T postgres psql -U '$PG_ADMIN_USER' -d jobs -tAc \"select count(*) from jobs.job_queue where kind='smoke-unknown-kind' and status='failed' and attempts=1\" | grep -qx 1"
 echo "smoke: lake-worker polled the queue, completed a job and failed an unknown kind"
+
+if [[ "${SMOKE_INGEST_HTTP:-0}" == "1" ]]; then
+  step="ingest_http"
+  jobs_sql() { compose exec -T postgres psql -qtA -U "$PG_ADMIN_USER" -d jobs -c "$1"; }
+  job_is() { [[ "$(jobs_sql "select status || ':' || attempts from jobs.job_queue where id = $1")" == "$2" ]]; }
+  worker_logs() { compose logs lake-worker 2>/dev/null; }
+  BCB_URL="https://api.bcb.gov.br/dados/serie/bcdata.sgs.1/dados/ultimos/5?formato=json"
+
+  # a. Host outside INGEST_HTTP_ALLOWED_HOSTS: fails at once, no retry, no request made.
+  id=$(jobs_sql "insert into jobs.job_queue(kind, payload) values ('ingest_http', '{\"url\": \"https://example.com/x.json\", \"table\": \"raw.smoke_x\"}') returning id")
+  wait_for "disallowed host failed" 60 job_is "$id" "failed:1"
+  jobs_sql "select last_error from jobs.job_queue where id = $id" | grep -q "INGEST_HTTP_ALLOWED_HOSTS" || fail "disallowed host: unexpected last_error"
+
+  # b. Real load from the BCB API into lake.raw.smoke_bcb (table created on the first load).
+  id=$(jobs_sql "insert into jobs.job_queue(kind, payload) values ('ingest_http', '{\"url\": \"$BCB_URL\", \"table\": \"raw.smoke_bcb\"}') returning id")
+  wait_for "ingest_http job done" 120 job_is "$id" "done:1"
+  worker_logs | grep "\"id\":$id" | grep -q "ingested records" || fail "worker did not log ingested records for job $id"
+
+  # c. Idempotency: the same job again finds its own _job_id and loads nothing.
+  jobs_sql "update jobs.job_queue set status = 'queued', available_at = now() where id = $id"
+  wait_for "re-run of ingest_http job done" 60 job_is "$id" "done:2"
+  worker_logs | grep "\"id\":$id" | grep -q "already loaded by an earlier attempt" || fail "re-run of job $id was not skipped"
+
+  # d. Clean layer over the raw table with a sql job; a SELECT logs its row count.
+  id=$(jobs_sql "insert into jobs.job_queue(kind, payload) values ('sql', '{\"sql\": [
+    \"CREATE SCHEMA IF NOT EXISTS lake.clean\",
+    \"CREATE TABLE IF NOT EXISTS lake.clean.smoke_dolar (dia DATE, cotacao DOUBLE)\",
+    \"INSERT INTO lake.clean.smoke_dolar SELECT to_date(data, ''%d/%m/%Y''), CAST(valor AS DOUBLE) FROM lake.raw.smoke_bcb WHERE to_date(data, ''%d/%m/%Y'') NOT IN (SELECT dia FROM lake.clean.smoke_dolar)\",
+    \"SELECT * FROM lake.clean.smoke_dolar\"]}') returning id")
+  wait_for "clean sql job done" 60 job_is "$id" "done:1"
+  worker_logs | grep "\"id\":$id" | grep '"statement":3' | grep -q '"rows":5' || fail "clean table of job $id does not have 5 rows"
+  worker_logs | grep "\"id\":$id" | grep '"statement":2' | grep -q '"written":5' || fail "clean insert of job $id did not report 5 rows written"
+  jobs_sql "update jobs.job_queue set status = 'queued', available_at = now() where id = $id"
+  wait_for "re-run of clean sql job done" 60 job_is "$id" "done:2"
+  [[ "$(worker_logs | grep "\"id\":$id" | grep '"statement":2' | grep -c '"written":')" == 2 ]] || fail "re-run of clean job $id not logged"
+  worker_logs | grep "\"id\":$id" | grep '"statement":2' | tail -1 | grep -q '"written":0' || fail "re-run of clean job $id wrote rows again"
+  echo "smoke: ingest_http loaded the BCB API, skipped its re-run, refused a disallowed host; clean job wrote 5 rows, its re-run 0"
+fi
 
 step="query"
 wait_for "lake-query running" "$TIMEOUT" running lake-query

@@ -10,28 +10,29 @@
 //!   job done or failed any more.
 //! The jobs database connection is re-established whenever it drops.
 //!
-//! Job kinds: `noop` / `smoke` (no work), `sql` (runs `payload.sql` against the
-//! `lake` catalog). Any other kind fails permanently. Real raw -> clean ->
-//! curated logic is added as new kinds in `run_job`.
+//! This file is the queue runtime only. Business logic lives in job kinds
+//! (`jobs/`): see `jobs/mod.rs` and docs/novos-jobs.md to add one.
 
-use std::any::Any;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+mod http_source;
+mod jobs;
+mod lake;
+mod records;
+
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use datafusion::catalog::{CatalogProvider, SchemaProvider};
-use datafusion::error::{DataFusionError, Result as DFResult};
+use anyhow::{Context, Result};
+use datafusion::catalog::CatalogProvider;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY};
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
-use iceberg_catalog_rest::{RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE};
-use iceberg_datafusion::IcebergCatalogProvider;
-use iceberg_storage_opendal::OpenDalStorageFactory;
+use iceberg::Catalog;
 use tokio_postgres::{Client, NoTls};
 use tracing::{error, info, warn};
+
+use crate::http_source::HttpSource;
+use crate::jobs::{JobContext, Shared};
+use crate::lake::{build_catalog, LakeCatalogProvider};
 
 /// Columns added after the first release; `01-jobs-db.sh` creates them on new volumes,
 /// this brings existing volumes up to date. `lake_worker` owns the table.
@@ -105,100 +106,6 @@ async fn shutdown_signal() {
     }
 }
 
-/// Builds the Iceberg REST catalog client from the compose environment (x-lake-client-env).
-async fn build_catalog(uri: &str, warehouse: &str) -> Result<Arc<dyn Catalog>> {
-    let mut props: HashMap<String, String> = HashMap::from([
-        (REST_CATALOG_PROP_URI.to_string(), uri.to_string()),
-        (REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.to_string()),
-    ]);
-    // Use the iceberg constants: a misspelt key is silently ignored by FileIO.
-    for (env, key) in [
-        ("LAKE_S3_ENDPOINT", S3_ENDPOINT),
-        ("LAKE_S3_REGION", S3_REGION),
-        ("LAKE_S3_ACCESS_KEY_ID", S3_ACCESS_KEY_ID),
-        ("LAKE_S3_SECRET_ACCESS_KEY", S3_SECRET_ACCESS_KEY),
-        ("LAKE_S3_PATH_STYLE", S3_PATH_STYLE_ACCESS),
-    ] {
-        if let Ok(value) = std::env::var(env) {
-            props.insert(key.to_string(), value);
-        }
-    }
-    // Lakekeeper honours this header; with "client-managed" it returns no credentials
-    // and the worker signs with the bucket-scoped key above.
-    if let Ok(mode) = std::env::var("LAKE_ACCESS_DELEGATION") {
-        props.insert("header.X-Iceberg-Access-Delegation".to_string(), mode);
-    }
-    let catalog = RestCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 { customized_credential_load: None }))
-        .load("lake", props)
-        .await
-        .context("load Iceberg REST catalog")?;
-    Ok(Arc::new(catalog))
-}
-
-/// The `lake` catalog as DataFusion sees it. `IcebergCatalogProvider` lists namespaces
-/// and tables once, at construction; this wrapper rebuilds it on `refresh` so tables
-/// created after startup become visible, and maps `CREATE SCHEMA lake.x` to an Iceberg
-/// namespace. Table data itself is never stale: each scan loads the current snapshot.
-#[derive(Debug)]
-struct LakeCatalogProvider {
-    catalog: Arc<dyn Catalog>,
-    inner: RwLock<Arc<IcebergCatalogProvider>>,
-}
-
-impl LakeCatalogProvider {
-    async fn try_new(catalog: Arc<dyn Catalog>) -> Result<Self> {
-        let inner = IcebergCatalogProvider::try_new(catalog.clone()).await.context("list Iceberg namespaces")?;
-        Ok(Self { catalog, inner: RwLock::new(Arc::new(inner)) })
-    }
-
-    async fn refresh(&self) -> Result<()> {
-        let fresh = IcebergCatalogProvider::try_new(self.catalog.clone()).await.context("refresh Iceberg catalog")?;
-        *self.inner.write().expect("catalog lock poisoned") = Arc::new(fresh);
-        Ok(())
-    }
-
-    fn current(&self) -> Arc<IcebergCatalogProvider> {
-        self.inner.read().expect("catalog lock poisoned").clone()
-    }
-}
-
-impl CatalogProvider for LakeCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema_names(&self) -> Vec<String> {
-        self.current().schema_names()
-    }
-
-    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.current().schema(name)
-    }
-
-    fn register_schema(&self, name: &str, _schema: Arc<dyn SchemaProvider>) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
-        // CatalogProvider is synchronous: run the REST round trips on a scoped thread that
-        // blocks on the runtime handle, which is safe from any runtime context.
-        let namespace = NamespaceIdent::new(name.to_string());
-        let handle = tokio::runtime::Handle::current();
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    handle.block_on(async {
-                        self.catalog
-                            .create_namespace(&namespace, HashMap::new())
-                            .await
-                            .map_err(|err| DataFusionError::External(Box::new(err)))?;
-                        self.refresh().await.map_err(|err| DataFusionError::External(err.into()))
-                    })
-                })
-                .join()
-                .map_err(|_| DataFusionError::Execution("create namespace thread panicked".to_string()))?
-        })?;
-        Ok(None)
-    }
-}
-
 /// The jobs database connection, re-established on demand after it drops.
 struct JobsDb {
     url: String,
@@ -237,67 +144,9 @@ struct Job {
     max_attempts: i32,
 }
 
-/// An error that retrying cannot fix (bad payload, unknown kind): the job fails at once.
-#[derive(Debug)]
-struct Permanent(String);
-
-impl std::fmt::Display for Permanent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Permanent {}
-
-fn permanent(message: impl Into<String>) -> anyhow::Error {
-    Permanent(message.into()).into()
-}
-
-/// Transformation hook: one arm per job kind. `Ok` marks the job done; an error marks it
-/// failed (retried with backoff unless it is `Permanent`). Jobs may run more than once
-/// (at-least-once delivery), so each kind must be safe to repeat.
-async fn run_job(ctx: &SessionContext, lake: Option<&LakeCatalogProvider>, job: &Job) -> Result<()> {
-    info!(id = job.id, kind = %job.kind, attempt = job.attempts, payload = %job.payload, "running job");
-    match job.kind.as_str() {
-        "noop" | "smoke" => Ok(()),
-        "sql" => {
-            let statements: Vec<&str> = match job.payload.get("sql") {
-                Some(serde_json::Value::String(sql)) => vec![sql.as_str()],
-                Some(serde_json::Value::Array(items)) => items
-                    .iter()
-                    .map(|item| item.as_str().ok_or_else(|| permanent("payload.sql items must be strings")))
-                    .collect::<Result<_>>()?,
-                _ => return Err(permanent("payload.sql must be a string or an array of strings")),
-            };
-            let Some(lake) = lake else { bail!("iceberg catalog not available") };
-            // Pick up namespaces and tables created since the last job.
-            lake.refresh().await?;
-            for (index, sql) in statements.iter().enumerate() {
-                let batches = ctx
-                    .sql(sql)
-                    .await
-                    .with_context(|| format!("plan statement {index}"))?
-                    .collect()
-                    .await
-                    .with_context(|| format!("execute statement {index}"))?;
-                let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-                info!(id = job.id, statement = index, rows, "statement done");
-            }
-            Ok(())
-        }
-        other => Err(permanent(format!("unknown job kind {other:?}"))),
-    }
-}
-
 /// Runs the job while refreshing its heartbeat. Returns `None` when the lease was lost
 /// (another replica reaped the job); the job future is dropped in that case.
-async fn run_with_heartbeat(
-    client: &Client,
-    ctx: &SessionContext,
-    lake: Option<&LakeCatalogProvider>,
-    job: &Job,
-    every: Duration,
-) -> Option<Result<()>> {
+async fn run_with_heartbeat(client: &Client, cx: &JobContext<'_>, job: &Job, every: Duration) -> Option<Result<()>> {
     let heartbeat = async {
         loop {
             tokio::time::sleep(every).await;
@@ -311,7 +160,7 @@ async fn run_with_heartbeat(
         }
     };
     tokio::select! {
-        result = run_job(ctx, lake, job) => Some(result),
+        result = jobs::dispatch(cx, &job.kind, &job.payload) => Some(result),
         () = heartbeat => None,
     }
 }
@@ -335,7 +184,7 @@ async fn finish_job(db: &mut JobsDb, job: &Job, result: Result<()>, backoff_secs
                 n == 1
             }),
             Err(err) => {
-                let retryable = err.downcast_ref::<Permanent>().is_none();
+                let retryable = !jobs::is_permanent(err);
                 let message = format!("{err:#}");
                 client
                     .query_opt(FAILED_SQL, &[&job.id, &job.attempts, &retryable, &backoff_secs, &message])
@@ -445,6 +294,10 @@ async fn main() -> Result<()> {
     let ctx = SessionContext::new_with_state(state);
     info!(memory_mb, spill_dir, "datafusion session ready");
 
+    // Resources shared by every job kind.
+    let shared = Shared { http: HttpSource::from_env()? };
+    info!(kinds = ?jobs::KINDS, ingest_http_allowed_hosts = ?shared.http.allowed_hosts(), "job kinds registered");
+
     // Register the Iceberg catalog as `lake`. If Lakekeeper is down at startup, retry at
     // the next job instead of exiting.
     let catalog = build_catalog(&catalog_uri, &warehouse).await?;
@@ -471,7 +324,10 @@ async fn main() -> Result<()> {
                     lake = register_lake(&ctx, &catalog).await;
                 }
                 let outcome = match db.client().await {
-                    Ok(client) => run_with_heartbeat(client, &ctx, lake.as_deref(), &job, heartbeat_every).await,
+                    Ok(client) => {
+                        let cx = JobContext::new(job.id, job.attempts, &ctx, lake.as_deref(), &shared);
+                        run_with_heartbeat(client, &cx, &job, heartbeat_every).await
+                    }
                     Err(err) => Some(Err(err)),
                 };
                 match outcome {

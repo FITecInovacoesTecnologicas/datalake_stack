@@ -12,14 +12,14 @@ O objetivo e ter um ambiente de desenvolvimento / prova de conceito pequeno, rap
 
 E indicado para quem precisa experimentar pipelines raw -> clean -> curated sobre Iceberg, ou validar uma arquitetura lakehouse antes de escolher infraestrutura definitiva.
 
-> **Estado:** o `lake-worker` executa jobs `sql` (DDL e append sobre Iceberg), mas ainda nao tem jobs de negocio. O `lake-query` atende consultas so de leitura. Veja [Limitacoes conhecidas](#limitacoes-conhecidas) e o passo a passo em [docs/funcionamento.md](docs/funcionamento.md).
+> **Estado:** o `lake-worker` executa jobs `sql` (DDL e append sobre Iceberg) e `ingest_http` (carga de APIs JSON externas na camada raw). Novos tipos de job seguem o guia [docs/novos-jobs.md](docs/novos-jobs.md). O `lake-query` atende consultas so de leitura. Veja [Limitacoes conhecidas](#limitacoes-conhecidas) e o passo a passo em [docs/funcionamento.md](docs/funcionamento.md).
 
 ## Funcionalidades
 
 - **Object storage S3 (RustFS):** bucket `lake` com chave de servico restrita ao bucket. A chave root so e usada pelo job `storage-init`.
 - **Catalogo Iceberg REST (Lakekeeper):** bootstrap e warehouse criados automaticamente e de forma idempotente, com metadados no Postgres e credenciais cifradas por `LAKEKEEPER_ENCRYPTION_KEY`.
 - **Postgres 16 + pg_cron:** uma instancia com dois bancos isolados por role, `catalog` (Lakekeeper) e `jobs` (fila `jobs.job_queue` + agendamento).
-- **lake-worker:** consome a fila com `FOR UPDATE SKIP LOCKED` e escala horizontalmente (`--scale lake-worker=N`). A entrega e *at-least-once*: o worker envia heartbeat, um reaper recupera jobs de workers mortos, ha retry com backoff exponencial e o worker reconecta ao Postgres sozinho. Executa SQL sobre o catalogo Iceberg (`lake`), usa memory pool e spill do DataFusion e faz shutdown gracioso em SIGTERM (grace period de 2 min).
+- **lake-worker:** consome a fila com `FOR UPDATE SKIP LOCKED` e escala horizontalmente (`--scale lake-worker=N`). A entrega e *at-least-once*: o worker envia heartbeat, um reaper recupera jobs de workers mortos, ha retry com backoff exponencial e o worker reconecta ao Postgres sozinho. Executa SQL sobre o catalogo Iceberg (`lake`) e le APIs HTTPS externas (com allowlist de hosts), usa memory pool e spill do DataFusion e faz shutdown gracioso em SIGTERM (grace period de 2 min).
 - **lake-query (perfil `query`):** endpoint Arrow Flight SQL **somente leitura** sobre DataFusion, com o catalogo Iceberg registrado como `lake` e atualizado a cada `LAKE_METADATA_CACHE_TTL_SECS`. Exige token (`LAKE_QUERY_TOKEN`) e responde aos metadados que ferramentas JDBC/ADBC consultam.
 - **pg-backup e lake-backup (perfil `ops`):** `pg_dump` dos dois bancos e copia do bucket do lake em `./backups`, sob demanda.
 - **Operacao por Makefile ou Taskfile:** gera segredos, sobe, escala, faz backup, roda o smoke test e derruba a pilha.
@@ -116,12 +116,13 @@ Kinds disponiveis:
 | `kind` | O que faz |
 |---|---|
 | `sql` | Executa `payload.sql` (string ou lista) no DataFusion. `CREATE SCHEMA lake.x` cria um namespace Iceberg; `CREATE TABLE` e `INSERT INTO` (append) gravam no lake. |
+| `ingest_http` | Le JSON de uma URL `https://` (host em `INGEST_HTTP_ALLOWED_HOSTS`) e faz append em `payload.table`, criando a tabela na primeira carga. Veja a [referencia](docs/novos-jobs.md#7-referencia-ingest_http) e o pipeline de exemplo [pipelines/exemplo-ptax.sql](pipelines/exemplo-ptax.sql). |
 | `noop`, `smoke` | Nao faz nada; serve para testes. |
 | qualquer outro | Falha na hora, sem retry (`unknown job kind`). |
 
 Como a fila se comporta em falhas:
 
-- **Erro no job:** o job volta para `queued` com `available_at = now() + JOB_RETRY_BACKOFF_SECS * 2^(tentativa-1)` (no maximo 1 h), ate `max_attempts` (padrao 3; pode ser definido por job no `insert`). Erros de payload e `kind` desconhecido nao sao repetidos.
+- **Erro no job:** o job volta para `queued` com `available_at = now() + JOB_RETRY_BACKOFF_SECS * 2^(tentativa-1)` (no maximo 1 h), ate `max_attempts` (padrao 3; pode ser definido por job no `insert`). Erros permanentes nao sao repetidos: payload invalido (inclusive campo desconhecido), `kind` desconhecido, host fora da allowlist.
 - **Worker morto (OOM, kill -9):** o job em `running` para de receber heartbeat. Depois de `JOB_LEASE_SECS` (60 s), qualquer replica o devolve para `queued`.
 - **Postgres reiniciado:** o worker reconecta na proxima consulta a fila.
 - Como um job pode rodar mais de uma vez, ele precisa ser seguro para repetir (`IF NOT EXISTS`, cargas idempotentes).
@@ -224,6 +225,14 @@ Todas as variaveis ficam em `.env`, gerado a partir de [env.example](env.example
 | `JOB_LEASE_SECS` | Tempo sem heartbeat ate um job `running` voltar para a fila | `60` |
 | `JOB_RETRY_BACKOFF_SECS` | Atraso base do retry (dobra a cada tentativa, maximo 1 h) | `30` |
 
+### Fontes externas (kind `ingest_http`)
+
+| Variavel | Descricao | Default |
+|---|---|---|
+| `INGEST_HTTP_ALLOWED_HOSTS` | Hosts que o worker pode consultar, separados por virgula (match exato, so `https://`). Vazio = nenhum | vazio no compose; `env.example` traz `api.bcb.gov.br,servicodados.ibge.gov.br` |
+| `INGEST_HTTP_MAX_BYTES` | Maior corpo de resposta lido | `33554432` (32 MiB) |
+| `INGEST_HTTP_TIMEOUT_SECS` | Timeout de cada requisicao, conexao inclusa | `60` |
+
 ### Limites de recursos (opcionais)
 
 O pool de memoria do DataFusion deve ficar abaixo do limite do container. O excedente vai para spill em `/spill`.
@@ -252,7 +261,17 @@ jobs-db/                 imagem Postgres 16 + pg_cron
   init/00-catalog-db.sh  cria banco/role catalog e extensoes do Lakekeeper
   init/01-jobs-db.sh     cria pg_cron, role lake_worker e jobs.job_queue
 lake-worker/             worker Rust (DataFusion 53, iceberg-rust 0.10, tokio-postgres)
+  src/main.rs            runtime da fila (claim, heartbeat, retry, reaper)
+  src/jobs/              tipos de job: contrato e registro (mod.rs), sql, ingest_http, noop
+  src/lake.rs            catalogo `lake` e helpers de tabela (criar, append)
+  src/records.rs         JSON -> Arrow, com inferencia de tipos
+  src/http_source.rs     cliente HTTPS com allowlist de hosts
 lake-query/              endpoint Flight SQL (arrow-flight 58, DataFusion 53, tonic 0.14)
+pipelines/               SQL versionado que enfileira e agenda jobs de cada projeto
+  exemplo-ptax.sql       pipeline de teste: API do BCB -> raw -> clean, com pg_cron
+docs/
+  funcionamento.md       como a pilha funciona, etapa por etapa
+  novos-jobs.md          como criar um novo tipo de job
 scripts/
   smoke.sh               smoke test ponta a ponta em projeto isolado
   gen-env.sh             gera o .env com segredos aleatorios (make env / task env)
@@ -264,15 +283,20 @@ tests/
 
 ### Implementar transformacoes
 
-A logica de negocio do worker fica no hook `run_job` em [lake-worker/src/main.rs](lake-worker/src/main.rs), com um ramo do `match` por `kind`. O hook recebe o `SessionContext` do DataFusion (com o catalogo Iceberg registrado como `lake`) e o job (`kind`, `payload`, tentativa).
+A logica de negocio do worker fica nos tipos de job, em [lake-worker/src/jobs/](lake-worker/src/jobs/). Cada tipo e um arquivo que implementa o trait `JobKind`: um nome (`KIND`), um `Payload` tipado (serde) e um `async fn run`. O registro em [jobs/mod.rs](lake-worker/src/jobs/mod.rs) liga o `kind` da fila ao tipo. O runtime da fila em `main.rs` nao muda.
 
 - Um retorno `Ok(())` marca o job como `done`.
 - Um `Err` agenda um retry ou, esgotadas as tentativas, marca o job como `failed`.
 - Um erro `permanent(...)` falha o job na hora.
 
-Antes de executar SQL, chame `lake.refresh()` para enxergar tabelas criadas por outros jobs.
+Antes de escrever codigo, veja se `sql` ou `ingest_http` resolvem so com payload. O passo a passo, o modelo de arquivo e o checklist de revisao estao em [docs/novos-jobs.md](docs/novos-jobs.md).
 
-Para casos simples, um job `sql` ja resolve sem codigo novo.
+Testes unitarios do worker, sem Rust no host:
+
+```bash
+docker run --rm -v "$PWD":/app -w /app -v rdl-cargo-registry:/usr/local/cargo/registry \
+  -v rdl-target:/app/target rust:1.99-bookworm cargo test -p lake-worker
+```
 
 Depois de alterar o codigo, recompile so o servico:
 
@@ -298,6 +322,7 @@ O smoke test sobe a pilha inteira no projeto `rust-datalake-smoke`, com portas 1
 - o bootstrap e o warehouse do Lakekeeper;
 - o `pg_cron` no banco `jobs`;
 - o worker processando um job ate `done`;
+- com `SMOKE_INGEST_HTTP=1` (exige internet): o `ingest_http` carregando a API do BCB, pulando a reexecucao do mesmo job, recusando um host fora da allowlist, e um job `sql` de limpeza sobre a tabela raw;
 - a porta Flight SQL.
 
 Ao final, derruba a pilha com os volumes e imprime `SMOKE=OK`. Use `KEEP=1` para manter a pilha no ar e `SMOKE_TIMEOUT_SECS` para ajustar a espera (default `600`).
@@ -306,7 +331,8 @@ Ao final, derruba a pilha com os volumes e imprime `SMOKE=OK`. Use `KEEP=1` para
 
 ## Limitacoes conhecidas
 
-- **Sem jobs de negocio:** o worker so conhece `sql` e `noop`. Transformacoes que nao cabem em SQL precisam de um novo `kind` em `run_job`.
+- **Fontes externas limitadas:** o `ingest_http` le JSON via `GET`, sem autenticacao nem paginacao. Outras fontes precisam de um novo tipo de job ([docs/novos-jobs.md](docs/novos-jobs.md)).
+- **Sem dependencia entre jobs:** a fila nao encadeia jobs. Um pipeline raw -> clean usa horarios ou `available_at` escalonados.
 - **Flight SQL parcial:** prepared statements, chaves primarias e estrangeiras e tipos XDBC respondem `unimplemented`. O endpoint e somente leitura e usa um token compartilhado, sem usuarios nem TLS.
 - **Tabelas de metadados Iceberg:** `SELECT * FROM lake.ns."t$snapshots"` funciona, mas escolher colunas ou agregar gera erro interno (bug do `iceberg-datafusion` 0.10.1, que ignora a projecao).
 - **Atualizar dependencias Rust:** o `Cargo.lock` do workspace, na raiz, esta commitado e o build usa `--locked`. Para atualizar, rode `cargo update` dentro de um container `rust:1.99-bookworm` e faca commit do lock.

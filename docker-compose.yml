@@ -4,7 +4,7 @@
 #   postgres        -> ONE instance, two databases: "catalog" (Lakekeeper) and "jobs" (pg_cron + queue)
 #   lakekeeper      -> Iceberg REST catalog (Rust)
 #   lakekeeper-init -> one-shot: bootstrap + warehouse pointing at the bucket
-#   lake-worker     -> Rust worker: raw -> clean -> curated jobs
+#   lake-worker     -> Rust worker: job kinds (sql, ingest_http, ...) for raw -> clean -> curated
 #   lake-query      -> (profile "query") SQL endpoint: DataFusion is a library, it needs a server
 #   pg-backup       -> (profile "ops") on-demand pg_dump of both databases
 #   lake-backup     -> (profile "ops") on-demand copy of the lake bucket
@@ -293,6 +293,12 @@ services:
       # DataFusion memory pool must stay below the container limit; spill the rest.
       LAKE_MEMORY_LIMIT_MB: ${WORKER_POOL_MB:-1400}
       LAKE_SPILL_DIR: /spill
+      # Job kind ingest_http: https only, and only to these hosts (comma-separated, exact
+      # match). Empty = no external source allowed. Keeps payload URLs away from the
+      # internal services (postgres, rustfs, lakekeeper).
+      INGEST_HTTP_ALLOWED_HOSTS: ${INGEST_HTTP_ALLOWED_HOSTS:-}
+      INGEST_HTTP_MAX_BYTES: ${INGEST_HTTP_MAX_BYTES:-33554432}
+      INGEST_HTTP_TIMEOUT_SECS: ${INGEST_HTTP_TIMEOUT_SECS:-60}
     volumes:
       - /spill                # anonymous: one spill dir per replica
     mem_limit: ${WORKER_MEM_LIMIT:-2g}

@@ -298,7 +298,7 @@ Um cliente Iceberg pode obter acesso ao S3 de tres formas. Esta pilha usa duas:
 
 ## Etapa 8: `lake-worker`
 
-**Imagem:** `rust-datalake/lake-worker:local`. **Espera:** `postgres` healthy **e** `lakekeeper-init` concluido. Codigo em [lake-worker/src/main.rs](../lake-worker/src/main.rs).
+**Imagem:** `rust-datalake/lake-worker:local`. **Espera:** `postgres` healthy **e** `lakekeeper-init` concluido. O runtime da fila esta em [lake-worker/src/main.rs](../lake-worker/src/main.rs); os tipos de job, em [lake-worker/src/jobs/](../lake-worker/src/jobs/).
 
 ### Configuracao recebida (ambiente)
 
@@ -306,6 +306,7 @@ Um cliente Iceberg pode obter acesso ao S3 de tres formas. Esta pilha usa duas:
 - `JOBS_DATABASE_URL=postgresql://lake_worker:<senha>@postgres:5432/jobs`
 - `POLL_INTERVAL_SECS=5`, `JOB_LEASE_SECS=60`, `JOB_RETRY_BACKOFF_SECS=30`
 - `LAKE_MEMORY_LIMIT_MB=1400`, `LAKE_SPILL_DIR=/spill`
+- `INGEST_HTTP_ALLOWED_HOSTS`, `INGEST_HTTP_MAX_BYTES=33554432`, `INGEST_HTTP_TIMEOUT_SECS=60`: usados pelo kind `ingest_http`.
 - Limites do container: `mem_limit: 2g`, `cpus: 2`. O pool do DataFusion (1400 MB) fica abaixo do limite do container (2 GB), e o que passar disso vai para spill em disco.
 - `/spill` e um **volume anonimo**, entao cada replica tem o seu.
 - `init: true` e `stop_grace_period: 2m`: o `tini` repassa o SIGTERM ao processo, que tem ate 2 minutos para terminar o job em andamento.
@@ -317,6 +318,8 @@ Os logs sao JSON estruturado (`tracing-subscriber`):
 1. Le e valida as variaveis. Se faltar uma obrigatoria, encerra com erro.
 2. Cria o diretorio de spill e monta o **runtime do DataFusion** (memory pool limitado, spill em `/spill`).
    → `datafusion session ready {memory_mb:1400, spill_dir:"/spill"}`
+   Em seguida, cria os recursos compartilhados pelos jobs (o cliente HTTPS do `ingest_http`) e loga os kinds registrados.
+   → `job kinds registered {kinds:["noop","smoke","sql","ingest_http"], ingest_http_allowed_hosts:[...]}`
 3. Cria o cliente do **catalogo REST** (iceberg-rust) com o `OpenDalStorageFactory::S3`, que e o FileIO usado para ler e gravar Parquet e metadados no RustFS. Em seguida, registra o catalogo no DataFusion como **`lake`**. Se o Lakekeeper estiver fora, o worker sobe mesmo assim e tenta registrar de novo no proximo job.
    → `iceberg catalog registered as \`lake\` {namespaces:N}`
 4. Conecta ao banco `jobs` (timeout de 10 s) e aplica a migracao idempotente das colunas novas.
@@ -370,17 +373,18 @@ Cada volta do loop executa:
 
 O worker mantem uma conexao e a recria quando ela cai. Se o Postgres reiniciar, a proxima consulta a fila detecta `is_closed()`, reconecta e segue normalmente. Se a conexao cair durante um job, o resultado e gravado apos a reconexao. Se nem isso for possivel, o reaper recupera o job quando o lease expirar.
 
-### O hook `run_job`
+### Tipos de job (`jobs/`)
 
-Ele despacha por `kind`:
+O runtime entrega o job claimado a `jobs::dispatch`, que escolhe o tipo pelo `kind`. Cada tipo implementa o trait `JobKind` ([jobs/mod.rs](../lake-worker/src/jobs/mod.rs)). O `payload` e convertido para o struct `Payload` do tipo antes da execucao; se nao bater (campo faltando, tipo errado, campo desconhecido), o job falha na hora, sem retry.
 
 | `kind` | Comportamento |
 |---|---|
 | `sql` | `payload.sql` e uma string ou uma lista. Antes de executar, o worker chama `lake.refresh()` para enxergar tabelas criadas por outros jobs. Cada instrucao e planejada e executada no DataFusion. `CREATE SCHEMA lake.x` cria um namespace Iceberg; `CREATE TABLE lake.x.t (...)` cria a tabela; `INSERT INTO ... VALUES/SELECT` faz append. |
+| `ingest_http` | `GET` numa URL `https://` de host permitido, extrai os registros JSON e faz append em `payload.table`, com `_job_id`, `_ingested_at` e `_source_url`. Cria a tabela na primeira carga. Pula a carga se o proprio `_job_id` ja estiver na tabela. Detalhes em [novos-jobs.md](novos-jobs.md#7-referencia-ingest_http). |
 | `noop`, `smoke` | Sucesso imediato. |
-| outro | Erro permanente: `unknown job kind "..."`. |
+| outro | Erro permanente: `unknown job kind "..."; known kinds: ...`. |
 
-A entrega e *at-least-once*: um job pode rodar mais de uma vez (por exemplo, apos um crash). Por isso, cada job precisa ser seguro para repetir (`IF NOT EXISTS`, cargas idempotentes). Transformacoes que nao cabem em SQL entram como um novo ramo do `match`.
+A entrega e *at-least-once*: um job pode rodar mais de uma vez (por exemplo, apos um crash). Por isso, cada job precisa ser seguro para repetir (`IF NOT EXISTS`, cargas idempotentes). Para criar um tipo novo, siga [novos-jobs.md](novos-jobs.md).
 
 ### Desligamento
 
@@ -390,7 +394,7 @@ Quando chega SIGTERM ou SIGINT, o loop termina na proxima espera (fila vazia) ou
 
 O `IcebergCatalogProvider` do crate `iceberg-datafusion` 0.10 lista namespaces e tabelas uma unica vez, quando e criado (ha um `TODO` sobre isso no proprio crate). Os dados nao ficam desatualizados, porque cada scan e cada insert recarregam o snapshot atual. A **lista** de tabelas, porem, fica. Por isso, os dois servicos o envolvem em um `LakeCatalogProvider` que reconstroi a listagem:
 
-- **worker:** antes de cada job `sql`. O wrapper tambem traduz `CREATE SCHEMA` para a criacao de um namespace no Lakekeeper.
+- **worker:** antes de cada job que usa o catalogo (`sql`, `ingest_http`), via `JobContext::lake()`. O wrapper tambem traduz `CREATE SCHEMA` para a criacao de um namespace no Lakekeeper.
 - **query:** quando a listagem tem mais de `LAKE_METADATA_CACHE_TTL_SECS` (30 s), **e** imediatamente quando uma consulta cita uma tabela desconhecida (refresh-on-miss, seguido de uma nova tentativa de planejamento).
 
 ---
@@ -503,7 +507,7 @@ Maquina de estados de um job:
     ├───────────────────────────────────────────────────────┤
     │  reaper: sem heartbeat ha JOB_LEASE_SECS              │
     └───────────────────────────────────────────────────────┤
-                                               run_job Ok ┌─┴──────────┐ erro permanente ou
+                                                 o job Ok ┌─┴──────────┐ erro permanente ou
                                                           ▼            ▼ tentativas esgotadas
                                                       ┌──────┐    ┌────────┐
                                                       │ done │    │ failed │  last_error
@@ -656,7 +660,7 @@ A partir daqui, enquanto o job roda, o worker atualizaria `heartbeat_at` a cada 
 
 ### P3: o worker atualiza a visao do catalogo (Lakekeeper)
 
-`run_job` ve `kind = "sql"`, le `payload.sql` (uma string, portanto uma instrucao) e chama `lake.refresh()`. O refresh reconstroi o `IcebergCatalogProvider` consultando o Lakekeeper pela API REST Iceberg:
+`jobs::dispatch` ve `kind = "sql"` e chama o tipo `Sql`, que le `payload.sql` (uma string, portanto uma instrucao) e chama `lake.refresh()`. O refresh reconstroi o `IcebergCatalogProvider` consultando o Lakekeeper pela API REST Iceberg:
 
 - `GET /catalog/v1/{warehouse}/namespaces` -> `raw`, `curated`;
 - `GET .../namespaces/{ns}/tables` para cada namespace;
@@ -712,11 +716,11 @@ snapshot 942438293836199047   parent 2671366834670874304  append  added-records=
 metadata-log: 2 versoes anteriores (00000 = tabela vazia, 00001 = carga inicial)
 ```
 
-O DataFusion devolve 1 linha com a contagem inserida, que o worker registra como `statement done {statement:0, rows:1}`.
+O DataFusion devolve 1 linha com a contagem inserida, que o worker registrava como `statement done {statement:0, rows:1}`. Desde 2026-10-09 o worker le essa contagem e registra `statement done {statement:0, written:N}`, com o numero de linhas gravadas.
 
 ### P7: o worker registra o resultado (Postgres)
 
-`run_job` retorna `Ok` e `finish_job` executa o `DONE_SQL` com fencing:
+O tipo `Sql` retorna `Ok` e `finish_job` executa o `DONE_SQL` com fencing:
 
 ```sql
 UPDATE jobs.job_queue SET status = 'done', finished_at = now(), last_error = NULL

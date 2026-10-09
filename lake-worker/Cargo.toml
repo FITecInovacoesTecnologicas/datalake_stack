@@ -19,7 +19,12 @@ iceberg-catalog-rest = "0.10"
 iceberg-datafusion = "0.10"
 # Since 0.10 the S3 FileIO lives here; the REST catalog needs it to read/write table files.
 iceberg-storage-opendal = { version = "0.10", default-features = false, features = ["opendal-s3"] }
-serde_json = "1"
+# HTTP client of the ingest_http job. Same version and TLS stack (rustls + system roots) that
+# opendal already compiles, so it adds no new heavy dependency.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: columns keep the key order the source sent.
+serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tracing = "0.1"
